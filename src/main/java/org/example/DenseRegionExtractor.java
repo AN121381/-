@@ -129,7 +129,7 @@ public final class DenseRegionExtractor {
             // 鉴于 CAD 图纸通常是横向或纵向排列，我们采用“垂直堆叠”策略来合并区域，中间保留少量间隙
             // 这样可以彻底消除“图画之间的空白”
 
-            int gap = 50; // 区域间隙
+            int gap = 100; // 区域间隙
             int totalWidth = 0;
             int totalHeight = 0;
 
@@ -209,6 +209,7 @@ public final class DenseRegionExtractor {
                 int minCy = cy;
                 int maxCy = cy;
                 double score = 0.0;
+                int activeCells = 0;
 
                 Deque<int[]> dq = new ArrayDeque<>();
                 dq.add(new int[] { cx, cy });
@@ -220,6 +221,7 @@ public final class DenseRegionExtractor {
                     int y = p[1];
                     double d = densities[y * cellsX + x];
                     score += d;
+                    activeCells++;
 
                     if (x < minCx) {
                         minCx = x;
@@ -263,8 +265,24 @@ public final class DenseRegionExtractor {
                 int y1 = Math.min(imgH, (maxCy + 1) * cellSize);
                 int w = Math.max(1, x1 - x0);
                 int h = Math.max(1, y1 - y0);
-                if (w * h >= options.minRegionPixels) {
-                    regions.add(new Region(x0, y0, w, h, score));
+
+                // 计算区域密度 (score / area)
+                // score 是 sum(ink/cellArea)
+                // total_ink = score * cellArea
+                // density = total_ink / (w*h)
+                double pixelDensity = (score * cellSize * cellSize) / (w * h);
+
+                // 计算网格填充率：有效网格数 / 矩形区域总网格数
+                int cellsW = maxCx - minCx + 1;
+                int cellsH = maxCy - minCy + 1;
+                double fillRatio = (double) activeCells / (double) (cellsW * cellsH);
+
+                if (w * h >= options.minRegionPixels && pixelDensity >= options.minRegionDensity
+                        && fillRatio >= options.minRegionFillRatio) {
+                    regions.add(new Region(x0, y0, w, h, score, activeCells));
+                } else {
+                    System.out.println("忽略区域: 尺寸=" + w + "x" + h + ", 密度=" +
+                            String.format("%.5f", pixelDensity) + ", 填充率=" + String.format("%.3f", fillRatio));
                 }
             }
         }
@@ -313,7 +331,7 @@ public final class DenseRegionExtractor {
         int y0 = Math.min(a.y, b.y);
         int x1 = Math.max(a.x + a.w, b.x + b.w);
         int y1 = Math.max(a.y + a.h, b.y + b.h);
-        return new Region(x0, y0, x1 - x0, y1 - y0, a.score + b.score);
+        return new Region(x0, y0, x1 - x0, y1 - y0, a.score + b.score, a.activeCells + b.activeCells);
     }
 
     private static int[][] buildInkIntegral(BufferedImage image, int bg, int bgDelta) {
@@ -420,7 +438,11 @@ public final class DenseRegionExtractor {
         // 网格划分目标横向单元格数
         public int gridTargetCellsAcross = 128;
         // 区域得分阈值比例
-        public double scoreThresholdRatio = 0.23;
+        public double scoreThresholdRatio = 0.0001;
+        // 最小区域像素密度 (ink/area)，用于过滤大而空的区域（如边框）
+        public double minRegionDensity = 0.0001;
+        // 最小网格填充率 (activeCells / rectCells)，用于过滤空心圆圈等
+        public double minRegionFillRatio = 0.2;
     }
 
     public static final class Region {
@@ -429,13 +451,19 @@ public final class DenseRegionExtractor {
         public final int w;
         public final int h;
         public final double score;
+        public final int activeCells;
 
         public Region(int x, int y, int w, int h, double score) {
+            this(x, y, w, h, score, 0);
+        }
+
+        public Region(int x, int y, int w, int h, double score, int activeCells) {
             this.x = x;
             this.y = y;
             this.w = w;
             this.h = h;
             this.score = score;
+            this.activeCells = activeCells;
         }
     }
 }

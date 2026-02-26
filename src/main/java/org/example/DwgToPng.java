@@ -52,7 +52,6 @@ public class DwgToPng {
         int maxRegions = args != null && args.length >= 5 ? Integer.parseInt(args[4]) : defaultMaxRegions;
 
         MemoryManager memoryManager = MemoryManager.GetMemoryManager();
-        MemoryTransaction transaction = memoryManager.StartTransaction();
         boolean initialized = false;
         try {
             CustomSystemServices systemServices = new CustomSystemServices();
@@ -62,74 +61,66 @@ public class DwgToPng {
             TD_DbCoreIntegrated_Globals.odInitialize(systemServices);
             initialized = true;
 
-            if (hostApp.findFile(srcFileName).isEmpty()) {
-                System.out.println("找不到.dwg文件: " + srcFileName);
+            java.io.File inputPath = new java.io.File(srcFileName);
+            java.io.File outputPath = new java.io.File(dstFileName);
+            java.util.List<java.io.File> filesToProcess = new java.util.ArrayList<>();
+
+            if (inputPath.isDirectory()) {
+                java.io.File[] files = inputPath.listFiles((dir, name) -> name.toLowerCase().endsWith(".dwg"));
+                if (files != null) {
+                    java.util.Collections.addAll(filesToProcess, files);
+                }
+                if (!outputPath.exists()) {
+                    outputPath.mkdirs();
+                }
+            } else {
+                filesToProcess.add(inputPath);
+            }
+
+            if (filesToProcess.isEmpty()) {
+                System.out.println("未找到需要处理的DWG文件: " + srcFileName);
                 return;
             }
 
-            OdDbDatabase database = hostApp.readFile(srcFileName);
-            renderToImage(database, dstFileName, width, height, maxResolutionLimit);
-            System.out.println("导出全图完成: " + dstFileName);
+            int totalFiles = filesToProcess.size();
+            System.out.println("共找到 " + totalFiles + " 个文件待处理。");
 
-            java.nio.file.Path finalOutPath = java.nio.file.Paths.get(dstFileName);
-            java.nio.file.Path tempOutPath = finalOutPath.resolveSibling(finalOutPath.getFileName() + ".temp.png");
+            for (int i = 0; i < totalFiles; i++) {
+                java.io.File srcFile = filesToProcess.get(i);
+                String currentSrcPath = srcFile.getAbsolutePath();
+                String currentDstPath;
 
-            // 移动原图到 temp，以便 DenseRegionExtractor 读取
-            java.nio.file.Files.move(finalOutPath, tempOutPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-
-            boolean success = false;
-            try {
-                DenseRegionExtractor.Options options = new DenseRegionExtractor.Options();
-                options.maxRegions = Math.max(1, maxRegions);
-
-                // 加载高级参数
-                if (config.containsKey("region_percentile")) {
-                    options.percentile = Double.parseDouble(config.getProperty("region_percentile"));
-                }
-                if (config.containsKey("min_cell_fill")) {
-                    options.minCellFill = Double.parseDouble(config.getProperty("min_cell_fill"));
-                }
-                if (config.containsKey("min_region_pixels")) {
-                    options.minRegionPixels = Integer.parseInt(config.getProperty("min_region_pixels"));
-                }
-                if (config.containsKey("margin_cells")) {
-                    options.marginCells = Integer.parseInt(config.getProperty("margin_cells"));
-                }
-                if (config.containsKey("bg_delta")) {
-                    options.bgDelta = Integer.parseInt(config.getProperty("bg_delta"));
-                }
-                if (config.containsKey("grid_target_cells_across")) {
-                    options.gridTargetCellsAcross = Integer.parseInt(config.getProperty("grid_target_cells_across"));
-                }
-                if (config.containsKey("score_threshold_ratio")) {
-                    options.scoreThresholdRatio = Double.parseDouble(config.getProperty("score_threshold_ratio"));
-                }
-
-                // 提取密集区域并合并，直接写入最终路径（覆盖原需求）
-                DenseRegionExtractor.extractDenseRegions(tempOutPath, finalOutPath, options);
-                success = true;
-                System.out.println("密集区域提取完成，已生成合并图: " + "合成图-" + dstFileName);
-            } catch (Exception e) {
-                System.err.println("密集区域提取过程中发生错误: " + e.getMessage());
-                e.printStackTrace();
-                throw e; // 重新抛出以便外层捕获
-            } finally {
-                if (success) {
-                    // 成功则清理临时全图
-                    java.nio.file.Files.deleteIfExists(tempOutPath);
+                if (inputPath.isDirectory()) {
+                    // 如果输入是目录，输出到输出目录，保持文件名
+                    String fileName = srcFile.getName();
+                    String baseName = fileName.substring(0, fileName.lastIndexOf('.'));
+                    currentDstPath = new java.io.File(outputPath, baseName + ".png").getAbsolutePath();
                 } else {
-                    // 如果失败，尝试恢复原图
-                    System.err.println("正在恢复原图...");
-                    try {
-                        if (java.nio.file.Files.exists(tempOutPath)) {
-                            java.nio.file.Files.move(tempOutPath, finalOutPath,
-                                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-                        }
-                    } catch (Exception restoreEx) {
-                        System.err.println("无法恢复原图: " + restoreEx.getMessage());
+                    // 如果输入是单个文件
+                    if (outputPath.isDirectory()) {
+                        String fileName = srcFile.getName();
+                        String baseName = fileName.substring(0, fileName.lastIndexOf('.'));
+                        currentDstPath = new java.io.File(outputPath, baseName + ".png").getAbsolutePath();
+                    } else {
+                        currentDstPath = outputPath.getAbsolutePath();
                     }
                 }
+
+                System.out.println("[" + (i + 1) + "/" + totalFiles + "] 正在转换文件: " + srcFile.getName());
+
+                MemoryTransaction transaction = memoryManager.StartTransaction();
+                try {
+                    processSingleFile(hostApp, currentSrcPath, currentDstPath, width, height, maxResolutionLimit,
+                            maxRegions, config);
+                } catch (Exception e) {
+                    System.err.println("文件处理失败 [" + srcFile.getName() + "]: " + e.getMessage());
+                    e.printStackTrace();
+                } finally {
+                    memoryManager.StopTransaction(transaction);
+                }
+                System.out.println("--------------------------------------------------");
             }
+
         } catch (OdError error) {
             System.out.println(error.description());
         } catch (Error error) {
@@ -137,9 +128,118 @@ public class DwgToPng {
         } catch (Exception error) {
             System.out.println(error);
         } finally {
-            memoryManager.StopTransaction(transaction);
             if (initialized) {
                 TD_DbCoreIntegrated_Globals.odUninitialize();
+            }
+        }
+    }
+
+    private static void processSingleFile(ExHostAppServices hostApp, String srcFileName, String dstFileName,
+            int width, int height, int maxResolutionLimit, int maxRegions, Properties config) {
+        if (hostApp.findFile(srcFileName).isEmpty()) {
+            System.out.println("找不到.dwg文件: " + srcFileName);
+            return;
+        }
+
+        // 使用临时 ASCII 文件名以避免潜在的路径编码问题
+        java.io.File dstFile = new java.io.File(dstFileName);
+        String tempFileName = "temp_" + System.currentTimeMillis() + "_" + (int) (Math.random() * 1000) + ".png";
+        java.io.File tempFile = new java.io.File(dstFile.getParent(), tempFileName);
+        String tempFilePath = tempFile.getAbsolutePath();
+
+        try {
+            OdDbDatabase database = hostApp.readFile(srcFileName);
+            renderToImage(database, tempFilePath, width, height, maxResolutionLimit);
+            System.out.println("导出全图完成: " + dstFileName); // 用户感知到的文件名
+        } catch (Exception e) {
+            // 如果渲染失败，删除临时文件并抛出异常
+            tempFile.delete();
+            throw e;
+        }
+
+        java.nio.file.Path finalOutPath = java.nio.file.Paths.get(dstFileName);
+        // 注意：这里 tempOutPath 是用于 DenseRegionExtractor 的中间文件，
+        // 但我们刚刚生成的 tempFilePath 才是全图。
+        // 原逻辑是：生成全图 -> 移动到 .temp.png -> 提取区域 -> 覆盖全图。
+
+        // 修改后的逻辑：
+        // 1. 全图生成在 tempFilePath (ASCII)
+        // 2. 将 tempFilePath 移动到 .temp.png (作为 DenseRegionExtractor 的输入)
+        // 3. DenseRegionExtractor 输出到 finalOutPath (中文路径)
+
+        java.nio.file.Path tempRegionInputPath = finalOutPath.resolveSibling(finalOutPath.getFileName() + ".temp.png");
+
+        try {
+            // 移动生成的 ASCII 临时全图到处理用的临时路径
+            java.nio.file.Files.move(tempFile.toPath(), tempRegionInputPath,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            System.err.println("无法移动临时文件: " + e.getMessage());
+            // 尝试删除原始临时文件
+            tempFile.delete();
+            return;
+        }
+
+        boolean success = false;
+        try {
+            DenseRegionExtractor.Options options = new DenseRegionExtractor.Options();
+            options.maxRegions = Math.max(1, maxRegions);
+
+            // 加载高级参数
+            if (config.containsKey("region_percentile")) {
+                options.percentile = Double.parseDouble(config.getProperty("region_percentile"));
+            }
+            if (config.containsKey("min_cell_fill")) {
+                options.minCellFill = Double.parseDouble(config.getProperty("min_cell_fill"));
+            }
+            if (config.containsKey("min_region_pixels")) {
+                options.minRegionPixels = Integer.parseInt(config.getProperty("min_region_pixels"));
+            }
+            if (config.containsKey("margin_cells")) {
+                options.marginCells = Integer.parseInt(config.getProperty("margin_cells"));
+            }
+            if (config.containsKey("bg_delta")) {
+                options.bgDelta = Integer.parseInt(config.getProperty("bg_delta"));
+            }
+            if (config.containsKey("grid_target_cells_across")) {
+                options.gridTargetCellsAcross = Integer.parseInt(config.getProperty("grid_target_cells_across"));
+            }
+            if (config.containsKey("score_threshold_ratio")) {
+                options.scoreThresholdRatio = Double.parseDouble(config.getProperty("score_threshold_ratio"));
+            }
+            if (config.containsKey("min_region_density")) {
+                options.minRegionDensity = Double.parseDouble(config.getProperty("min_region_density"));
+            }
+            if (config.containsKey("min_region_fill_ratio")) {
+                options.minRegionFillRatio = Double.parseDouble(config.getProperty("min_region_fill_ratio"));
+            }
+
+            // 提取密集区域并合并，直接写入最终路径
+            DenseRegionExtractor.extractDenseRegions(tempRegionInputPath, finalOutPath, options);
+            success = true;
+            System.out.println("密集区域提取完成: " + dstFileName);
+        } catch (Exception e) {
+            System.err.println("密集区域提取过程中发生错误: " + e.getMessage());
+            e.printStackTrace();
+            throw new RuntimeException(e);
+        } finally {
+            if (success) {
+                // 成功则清理临时全图
+                try {
+                    java.nio.file.Files.deleteIfExists(tempRegionInputPath);
+                } catch (IOException ignored) {
+                }
+            } else {
+                // 如果失败，尝试恢复原图 (从 tempRegionInputPath 移动回 finalOutPath)
+                System.err.println("正在恢复原图...");
+                try {
+                    if (java.nio.file.Files.exists(tempRegionInputPath)) {
+                        java.nio.file.Files.move(tempRegionInputPath, finalOutPath,
+                                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                    }
+                } catch (Exception restoreEx) {
+                    System.err.println("无法恢复原图: " + restoreEx.getMessage());
+                }
             }
         }
     }
