@@ -18,6 +18,71 @@ public final class DenseRegionExtractor {
     private DenseRegionExtractor() {
     }
 
+    public static List<Region> extractRegions(BufferedImage image, Options options) {
+        int width = image.getWidth();
+        int height = image.getHeight();
+
+        // 1. Estimate background
+        int bg = estimateBackgroundColor(image);
+
+        // 2. Grid setup
+        int cellSize = Math.max(16, Math.min(width, height) / Math.max(32, options.gridTargetCellsAcross));
+        int cellsX = (width + cellSize - 1) / cellSize;
+        int cellsY = (height + cellSize - 1) / cellSize;
+
+        // 3. Integral image
+        int[][] integral = buildInkIntegral(image, bg, options.bgDelta);
+
+        double[] densities = new double[cellsX * cellsY];
+        for (int cy = 0; cy < cellsY; cy++) {
+            for (int cx = 0; cx < cellsX; cx++) {
+                int x0 = cx * cellSize;
+                int y0 = cy * cellSize;
+                int x1 = Math.min(width, x0 + cellSize);
+                int y1 = Math.min(height, y0 + cellSize);
+                int ink = rectSum(integral, x0, y0, x1, y1);
+                int area = (x1 - x0) * (y1 - y0);
+                densities[cy * cellsX + cx] = area <= 0 ? 0.0 : ((double) ink) / (double) area;
+            }
+        }
+
+        double threshold = Math.max(options.minCellFill, percentile(densities, options.percentile));
+        boolean[][] dense = new boolean[cellsY][cellsX];
+        for (int cy = 0; cy < cellsY; cy++) {
+            for (int cx = 0; cx < cellsX; cx++) {
+                dense[cy][cx] = densities[cy * cellsX + cx] >= threshold;
+            }
+        }
+
+        // 4. Find regions
+        List<Region> regions = findAndMergeRegions(dense, densities, cellsX, cellsY, cellSize, width, height, options);
+
+        // 5. Sort
+        regions.sort(Comparator.comparingDouble((Region r) -> r.score).reversed());
+
+        // 6. Filter
+        if (!regions.isEmpty()) {
+            double maxScore = regions.get(0).score;
+            double scoreThreshold = maxScore * options.scoreThresholdRatio;
+
+            List<Region> filtered = new ArrayList<>();
+            for (Region r : regions) {
+                if (r.score >= scoreThreshold) {
+                    filtered.add(r);
+                }
+            }
+            if (filtered.isEmpty()) {
+                filtered.add(regions.get(0));
+            }
+            if (filtered.size() > options.maxRegions) {
+                filtered = new ArrayList<>(filtered.subList(0, options.maxRegions));
+            }
+            regions = filtered;
+        }
+
+        return regions;
+    }
+
     public static void extractDenseRegions(Path inputPng, Path outputMergedPng, Options options) throws IOException {
         try (ImageInputStream iis = ImageIO.createImageInputStream(inputPng.toFile())) {
             Iterator<ImageReader> readers = ImageIO.getImageReaders(iis);
@@ -129,7 +194,8 @@ public final class DenseRegionExtractor {
             // 鉴于 CAD 图纸通常是横向或纵向排列，我们采用“垂直堆叠”策略来合并区域，中间保留少量间隙
             // 这样可以彻底消除“图画之间的空白”
 
-            int gap = 100; // 区域间隙
+            // 区域间隙
+            int gap = 100;
             int totalWidth = 0;
             int totalHeight = 0;
 
