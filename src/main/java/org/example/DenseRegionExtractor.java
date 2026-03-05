@@ -18,72 +18,7 @@ public final class DenseRegionExtractor {
     private DenseRegionExtractor() {
     }
 
-    public static List<Region> extractRegions(BufferedImage image, Options options) {
-        int width = image.getWidth();
-        int height = image.getHeight();
-
-        // 1. Estimate background
-        int bg = estimateBackgroundColor(image);
-
-        // 2. Grid setup
-        int cellSize = Math.max(16, Math.min(width, height) / Math.max(32, options.gridTargetCellsAcross));
-        int cellsX = (width + cellSize - 1) / cellSize;
-        int cellsY = (height + cellSize - 1) / cellSize;
-
-        // 3. Integral image
-        int[][] integral = buildInkIntegral(image, bg, options.bgDelta);
-
-        double[] densities = new double[cellsX * cellsY];
-        for (int cy = 0; cy < cellsY; cy++) {
-            for (int cx = 0; cx < cellsX; cx++) {
-                int x0 = cx * cellSize;
-                int y0 = cy * cellSize;
-                int x1 = Math.min(width, x0 + cellSize);
-                int y1 = Math.min(height, y0 + cellSize);
-                int ink = rectSum(integral, x0, y0, x1, y1);
-                int area = (x1 - x0) * (y1 - y0);
-                densities[cy * cellsX + cx] = area <= 0 ? 0.0 : ((double) ink) / (double) area;
-            }
-        }
-
-        double threshold = Math.max(options.minCellFill, percentile(densities, options.percentile));
-        boolean[][] dense = new boolean[cellsY][cellsX];
-        for (int cy = 0; cy < cellsY; cy++) {
-            for (int cx = 0; cx < cellsX; cx++) {
-                dense[cy][cx] = densities[cy * cellsX + cx] >= threshold;
-            }
-        }
-
-        // 4. Find regions
-        List<Region> regions = findAndMergeRegions(dense, densities, cellsX, cellsY, cellSize, width, height, options);
-
-        // 5. Sort
-        regions.sort(Comparator.comparingDouble((Region r) -> r.score).reversed());
-
-        // 6. Filter
-        if (!regions.isEmpty()) {
-            double maxScore = regions.get(0).score;
-            double scoreThreshold = maxScore * options.scoreThresholdRatio;
-
-            List<Region> filtered = new ArrayList<>();
-            for (Region r : regions) {
-                if (r.score >= scoreThreshold) {
-                    filtered.add(r);
-                }
-            }
-            if (filtered.isEmpty()) {
-                filtered.add(regions.get(0));
-            }
-            if (filtered.size() > options.maxRegions) {
-                filtered = new ArrayList<>(filtered.subList(0, options.maxRegions));
-            }
-            regions = filtered;
-        }
-
-        return regions;
-    }
-
-    public static void extractDenseRegions(Path inputPng, Path outputMergedPng, Options options) throws IOException {
+    public static DetectionResult detectDenseRegions(Path inputPng, Options options) throws IOException {
         try (ImageInputStream iis = ImageIO.createImageInputStream(inputPng.toFile())) {
             Iterator<ImageReader> readers = ImageIO.getImageReaders(iis);
             if (!readers.hasNext()) {
@@ -95,30 +30,25 @@ public final class DenseRegionExtractor {
             int width = reader.getWidth(0);
             int height = reader.getHeight(0);
 
-            // 1. 计算缩放比例，使处理图像不超过 2048x2048，避免 OOM
             int targetDim = 4096;
             int scale = 1;
             while (width / scale > targetDim || height / scale > targetDim) {
                 scale *= 2;
             }
 
-            // 2. 读取降采样后的图像用于分析
             ImageReadParam param = reader.getDefaultReadParam();
             param.setSourceSubsampling(scale, scale, 0, 0);
             BufferedImage smallImage = reader.read(0, param);
 
-            // 3. 调整参数以适应缩小后的图像
             int smallWidth = smallImage.getWidth();
             int smallHeight = smallImage.getHeight();
             int bg = estimateBackgroundColor(smallImage);
 
-            // 计算网格
             int cellSize = Math.max(16,
                     Math.min(smallWidth, smallHeight) / Math.max(32, options.gridTargetCellsAcross));
             int cellsX = (smallWidth + cellSize - 1) / cellSize;
             int cellsY = (smallHeight + cellSize - 1) / cellSize;
 
-            // 积分图计算
             int[][] integral = buildInkIntegral(smallImage, bg, options.bgDelta);
 
             double[] densities = new double[cellsX * cellsY];
@@ -142,16 +72,15 @@ public final class DenseRegionExtractor {
                 }
             }
 
-            // 4. 在小图上查找区域
-            // 注意：minRegionPixels 需要根据 scale 进行调整
             Options scaledOptions = new Options();
             scaledOptions.minRegionPixels = Math.max(1, options.minRegionPixels / (scale * scale));
             scaledOptions.marginCells = options.marginCells;
+            scaledOptions.minRegionDensity = options.minRegionDensity;
+            scaledOptions.minRegionFillRatio = options.minRegionFillRatio;
 
             List<Region> smallRegions = findAndMergeRegions(dense, densities, cellsX, cellsY, cellSize, smallWidth,
                     smallHeight, scaledOptions);
 
-            // 5. 映射回原图坐标
             List<Region> originalRegions = new ArrayList<>();
             for (Region r : smallRegions) {
                 originalRegions.add(new Region(r.x * scale, r.y * scale, r.w * scale, r.h * scale, r.score));
@@ -159,10 +88,8 @@ public final class DenseRegionExtractor {
 
             originalRegions.sort(Comparator.comparingDouble((Region r) -> r.score).reversed());
 
-            // 智能过滤：根据分数阈值筛选有效区域，同时处理“忽略空白”和“去除杂项”的需求
             if (!originalRegions.isEmpty()) {
                 double maxScore = originalRegions.get(0).score;
-                // 阈值设为最大分数的一定比例，低于此分数的区域被视为噪点或不重要内容
                 double scoreThreshold = maxScore * options.scoreThresholdRatio;
 
                 List<Region> filtered = new ArrayList<>();
@@ -172,17 +99,35 @@ public final class DenseRegionExtractor {
                     }
                 }
 
-                // 如果过滤后为空（理论上不会，因为至少有maxScore），则保留top1
                 if (filtered.isEmpty()) {
                     filtered.add(originalRegions.get(0));
                 }
 
-                // 限制最大数量
                 if (filtered.size() > options.maxRegions) {
                     filtered = new ArrayList<>(filtered.subList(0, options.maxRegions));
                 }
                 originalRegions = filtered;
             }
+
+            originalRegions.sort(Comparator.comparingInt((Region r) -> r.y).thenComparingInt(r -> r.x));
+            return new DetectionResult(width, height, originalRegions);
+        }
+    }
+
+    public static void extractDenseRegions(Path inputPng, Path outputMergedPng, Options options) throws IOException {
+        try (ImageInputStream iis = ImageIO.createImageInputStream(inputPng.toFile())) {
+            Iterator<ImageReader> readers = ImageIO.getImageReaders(iis);
+            if (!readers.hasNext()) {
+                throw new IOException("无法读取 PNG: " + inputPng);
+            }
+            ImageReader reader = readers.next();
+            reader.setInput(iis);
+
+            int width = reader.getWidth(0);
+            int height = reader.getHeight(0);
+
+            DetectionResult detected = detectDenseRegions(inputPng, options);
+            List<Region> originalRegions = detected.regions;
 
             if (originalRegions.isEmpty()) {
                 Files.copy(inputPng, outputMergedPng, StandardCopyOption.REPLACE_EXISTING);
@@ -194,8 +139,7 @@ public final class DenseRegionExtractor {
             // 鉴于 CAD 图纸通常是横向或纵向排列，我们采用“垂直堆叠”策略来合并区域，中间保留少量间隙
             // 这样可以彻底消除“图画之间的空白”
 
-            // 区域间隙
-            int gap = 100;
+            int gap = 100; // 区域间隙
             int totalWidth = 0;
             int totalHeight = 0;
 
@@ -228,9 +172,6 @@ public final class DenseRegionExtractor {
 
                 int currentY = 0;
                 ImageReadParam chunkParam = reader.getDefaultReadParam();
-
-                // 为了视觉上的连贯性，可以先按 Y 坐标排序，再按 X 坐标排序
-                originalRegions.sort(Comparator.comparingInt((Region r) -> r.y).thenComparingInt(r -> r.x));
 
                 for (Region r : originalRegions) {
                     // 裁剪区域
@@ -347,8 +288,8 @@ public final class DenseRegionExtractor {
                         && fillRatio >= options.minRegionFillRatio) {
                     regions.add(new Region(x0, y0, w, h, score, activeCells));
                 } else {
-                    System.out.println("忽略区域: 尺寸=" + w + "x" + h + ", 密度=" +
-                            String.format("%.5f", pixelDensity) + ", 填充率=" + String.format("%.3f", fillRatio));
+                    System.out.println("忽略区域: 尺寸=" + w + "x" + h + ", 密度=" + String.format("%.5f", pixelDensity)
+                            + ", 填充率=" + String.format("%.3f", fillRatio));
                 }
             }
         }
@@ -530,6 +471,18 @@ public final class DenseRegionExtractor {
             this.h = h;
             this.score = score;
             this.activeCells = activeCells;
+        }
+    }
+
+    public static final class DetectionResult {
+        public final int width;
+        public final int height;
+        public final List<Region> regions;
+
+        public DetectionResult(int width, int height, List<Region> regions) {
+            this.width = width;
+            this.height = height;
+            this.regions = regions;
         }
     }
 }

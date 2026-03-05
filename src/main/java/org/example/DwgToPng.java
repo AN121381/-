@@ -2,18 +2,12 @@ package org.example;
 
 import com.opendesign.drawings.td_dbcoreintegrated.*;
 import com.opendesign.kernel.td_rootintegrated.*;
-import teigha.OdActivationInfo;
 
-import javax.imageio.ImageIO;
-import java.awt.*;
-import java.awt.image.BufferedImage;
+import teigha.OdActivationInfo;
 import java.io.FileInputStream;
-import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Properties;
 
 public class DwgToPng {
@@ -141,516 +135,583 @@ public class DwgToPng {
         }
     }
 
-    private static void processSingleFile(ExHostAppServices hostApp, String srcFileName, String dstFileName,
-            int width, int height, int maxResolutionLimit, int maxRegions, Properties config) {
+    private static void processSingleFile(ExHostAppServices hostApp, String srcFileName, String dstFileName, int width,
+            int height, int maxResolutionLimit, int maxRegions, Properties config) {
         if (hostApp.findFile(srcFileName).isEmpty()) {
             System.out.println("找不到.dwg文件: " + srcFileName);
             return;
         }
 
+        boolean rerenderRegions = Boolean.parseBoolean(config.getProperty("rerender_regions", "false"));
+        boolean rerenderWhiteFrames = Boolean.parseBoolean(config.getProperty("rerender_white_frames", "false"));
+        boolean whiteFrameDebugLog = Boolean.parseBoolean(config.getProperty("white_frame_debug_log", "false"));
+        double regionRerenderScale = Double.parseDouble(config.getProperty("region_rerender_scale", "2.0"));
+        int regionRerenderMaxDimension = Integer.parseInt(config.getProperty("region_rerender_max_dimension", "16384"));
+        boolean keepRegionImages = Boolean.parseBoolean(config.getProperty("keep_region_images", "true"));
+        int stitchGap = Integer.parseInt(config.getProperty("stitch_gap", "100"));
+        int mergedMaxDimension = Integer.parseInt(config.getProperty("merged_max_dimension", "45000"));
+        double regionMarginRatio = Double.parseDouble(config.getProperty("region_margin_ratio", "0.02"));
+        boolean keepFullImage = Boolean.parseBoolean(config.getProperty("keep_full_image", "false"));
+        double whiteFrameSearchExpandRatio = Double
+                .parseDouble(config.getProperty("white_frame_search_expand_ratio", "0.5"));
+        int whiteFrameGrayThreshold = Integer.parseInt(config.getProperty("white_frame_gray_threshold", "160"));
+        int whiteFrameChannelDelta = Integer.parseInt(config.getProperty("white_frame_channel_delta", "40"));
+        int whiteFrameMinBoxDim = Integer.parseInt(config.getProperty("white_frame_min_box_dim", "200"));
+        double whiteFrameMinSideCoverage = Double
+                .parseDouble(config.getProperty("white_frame_min_side_coverage", "0.12"));
+        double whiteFrameMaxInnerCoverage = Double
+                .parseDouble(config.getProperty("white_frame_max_inner_coverage", "0.06"));
+        int whiteFrameMarginPx = Integer.parseInt(config.getProperty("white_frame_margin_px", "20"));
+        int whiteFrameMaxFrames = Integer.parseInt(config.getProperty("white_frame_max_frames", "3"));
+        double dwgFrameSearchExpandRatio = Double
+                .parseDouble(config.getProperty("dwg_frame_search_expand_ratio", "1.0"));
+        double dwgFrameMarginRatio = Double.parseDouble(config.getProperty("dwg_frame_margin_ratio", "0.02"));
+        double dwgFrameMinAreaRatio = Double.parseDouble(config.getProperty("dwg_frame_min_area_ratio", "0.02"));
+        boolean dwgFrameDebugLog = Boolean.parseBoolean(config.getProperty("dwg_frame_debug_log", "false"));
+        boolean dwgFrameOnly = Boolean.parseBoolean(config.getProperty("dwg_frame_only", "false"));
+        boolean effectiveRerenderRegions = rerenderRegions || rerenderWhiteFrames;
+
+        System.out.println("模式: rerender_regions=" + rerenderRegions + ", rerender_white_frames=" + rerenderWhiteFrames
+                + ", effective_rerender_regions=" + effectiveRerenderRegions + ", dwg_frame_only=" + dwgFrameOnly
+                + ", dwg_frame_debug_log=" + dwgFrameDebugLog);
+        // 使用临时 ASCII 文件名以避免潜在的路径编码问题
+        java.io.File dstFile = new java.io.File(dstFileName);
+        String tempFileName = "temp_" + System.currentTimeMillis() + "_" + (int) (Math.random() * 1000) + ".png";
+        java.io.File tempFile = new java.io.File(dstFile.getParent(), tempFileName);
+        String tempFilePath = tempFile.getAbsolutePath();
+
+        RenderResult fullRender;
+        OdDbDatabase database;
         try {
-            OdDbDatabase database = hostApp.readFile(srcFileName);
+            database = hostApp.readFile(srcFileName);
+            fullRender = renderToImage(database, tempFilePath, width, height, maxResolutionLimit);
+            System.out.println("导出全图完成: " + dstFileName); // 用户感知到的文件名
+        } catch (Exception e) {
+            // 如果渲染失败，删除临时文件并抛出异常
+            tempFile.delete();
+            throw e;
+        }
 
-            // 1. 生成低分辨率代理图用于分析
-            System.out.println("正在生成代理图像进行分析...");
+        java.nio.file.Path finalOutPath = java.nio.file.Paths.get(dstFileName);
+        // 注意：这里 tempOutPath 是用于 DenseRegionExtractor 的中间文件，
+        // 但我们刚刚生成的 tempFilePath 才是全图。
+        // 原逻辑是：生成全图 -> 移动到 .temp.png -> 提取区域 -> 覆盖全图。
 
-            // 先进行空间分析获取准确的边界 (过滤隐藏层)
-            SpatialAnalyzer.Result vectorAnalysis = SpatialAnalyzer.analyze(database, 10);
-            OdGeExtents3d proxyExtents = vectorAnalysis.totalExtents;
+        // 修改后的逻辑：
+        // 1. 全图生成在 tempFilePath (ASCII)
+        // 2. 将 tempFilePath 移动到 .temp.png (作为 DenseRegionExtractor 的输入)
+        // 3. DenseRegionExtractor 输出到 finalOutPath (中文路径)
 
-            if (proxyExtents == null) {
-                System.out.println("无法获取有效边界，尝试默认全图渲染...");
-            } else {
-                System.out.println("使用空间分析计算的边界进行代理渲染...");
-            }
+        java.nio.file.Path tempRegionInputPath = finalOutPath.resolveSibling(finalOutPath.getFileName() + ".temp.png");
 
-            // 计算代理图像尺寸 (最大边长 8192) - 提高分辨率以捕捉细节
-            int proxyMaxDim = 8192;
-            int proxyW, proxyH;
+        try {
+            // 移动生成的 ASCII 临时全图到处理用的临时路径
+            java.nio.file.Files.move(tempFile.toPath(), tempRegionInputPath,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            System.err.println("无法移动临时文件: " + e.getMessage());
+            // 尝试删除原始临时文件
+            tempFile.delete();
+            return;
+        }
 
-            // 根据实际内容的宽高比来计算代理图尺寸，避免产生巨大的黑边导致坐标映射偏差
-            if (proxyExtents != null) {
-                OdGePoint3d min = proxyExtents.minPoint();
-                OdGePoint3d max = proxyExtents.maxPoint();
-                double worldW = Math.abs(max.getX() - min.getX());
-                double worldH = Math.abs(max.getY() - min.getY());
-
-                if (worldW >= worldH) {
-                    proxyW = proxyMaxDim;
-                    proxyH = (int) Math.max(1, Math.round(proxyMaxDim * (worldH / worldW)));
-                } else {
-                    proxyH = proxyMaxDim;
-                    proxyW = (int) Math.max(1, Math.round(proxyMaxDim * (worldW / worldH)));
-                }
-                System.out.println("根据内容范围计算代理图尺寸: " + proxyW + "x" + proxyH + " (原始宽高比: " + (worldW / worldH) + ")");
-            } else {
-                // Fallback if extents are missing
-                int[] proxySize = normalizeRenderSize(width, height, proxyMaxDim);
-                proxyW = proxySize[0];
-                proxyH = proxySize[1];
-            }
-
-            java.io.File dstFile = new java.io.File(dstFileName);
-            java.io.File parentDir = dstFile.getParentFile();
-            if (parentDir != null && !parentDir.exists()) {
-                parentDir.mkdirs();
-            }
-
-            String proxyFileName = "proxy_" + System.currentTimeMillis() + ".png";
-            java.io.File proxyFile = new java.io.File(parentDir, proxyFileName);
-
-            // 渲染全图到代理文件
-            // 如果 proxyExtents 不为空，使用它；否则传 null (使用 zoomExtents)
-            renderRegionToImage(database, proxyFile.getAbsolutePath(), proxyW, proxyH, proxyMaxDim, proxyExtents);
-
-            if (!proxyFile.exists()) {
-                throw new RuntimeException("代理图像生成失败");
-            }
-
-            // 2. 分析代理图像提取区域
-            System.out.println("正在分析像素分布...");
-            BufferedImage proxyImage = ImageIO.read(proxyFile);
-
+        boolean success = false;
+        try {
             DenseRegionExtractor.Options options = new DenseRegionExtractor.Options();
             options.maxRegions = Math.max(1, maxRegions);
-            if (config.containsKey("region_percentile"))
+
+            // 加载高级参数
+            if (config.containsKey("region_percentile")) {
                 options.percentile = Double.parseDouble(config.getProperty("region_percentile"));
-            if (config.containsKey("min_cell_fill"))
+            }
+            if (config.containsKey("min_cell_fill")) {
                 options.minCellFill = Double.parseDouble(config.getProperty("min_cell_fill"));
-            // Scale min pixels relative to proxy size vs original size?
-            // The options are usually tuned for 2000-4000px images, so defaults should work
-            // for 4096 proxy.
-            if (config.containsKey("min_region_pixels"))
+            }
+            if (config.containsKey("min_region_pixels")) {
                 options.minRegionPixels = Integer.parseInt(config.getProperty("min_region_pixels"));
-            if (config.containsKey("margin_cells"))
+            }
+            if (config.containsKey("margin_cells")) {
                 options.marginCells = Integer.parseInt(config.getProperty("margin_cells"));
-            if (config.containsKey("bg_delta"))
+            }
+            if (config.containsKey("bg_delta")) {
                 options.bgDelta = Integer.parseInt(config.getProperty("bg_delta"));
-            if (config.containsKey("grid_target_cells_across"))
+            }
+            if (config.containsKey("grid_target_cells_across")) {
                 options.gridTargetCellsAcross = Integer.parseInt(config.getProperty("grid_target_cells_across"));
-            if (config.containsKey("score_threshold_ratio"))
+            }
+            if (config.containsKey("score_threshold_ratio")) {
                 options.scoreThresholdRatio = Double.parseDouble(config.getProperty("score_threshold_ratio"));
-            if (config.containsKey("min_region_density"))
+            }
+            if (config.containsKey("min_region_density")) {
                 options.minRegionDensity = Double.parseDouble(config.getProperty("min_region_density"));
-            if (config.containsKey("min_region_fill_ratio"))
+            }
+            if (config.containsKey("min_region_fill_ratio")) {
                 options.minRegionFillRatio = Double.parseDouble(config.getProperty("min_region_fill_ratio"));
-
-            System.out.println("提取参数: 密度阈值=" + options.minRegionDensity + ", 填充率阈值=" + options.minRegionFillRatio
-                    + ", 分数比例=" + options.scoreThresholdRatio);
-
-            List<DenseRegionExtractor.Region> pixelRegions = DenseRegionExtractor.extractRegions(proxyImage, options);
-
-            // Delete proxy file
-            proxyFile.delete();
-
-            if (pixelRegions.isEmpty()) {
-                System.out.println("未找到明显密集区域，将执行全图渲染...");
-                renderRegionToImage(database, dstFileName, width, height, maxResolutionLimit, null);
-                return;
             }
 
-            System.out.println("找到 " + pixelRegions.size() + " 个密集区域，准备高分辨率渲染...");
+            if (!effectiveRerenderRegions) {
+                DenseRegionExtractor.extractDenseRegions(tempRegionInputPath, finalOutPath, options);
+                success = true;
+                System.out.println("密集区域提取完成: " + dstFileName);
+            } else {
+                DenseRegionExtractor.DetectionResult detected = DenseRegionExtractor
+                        .detectDenseRegions(tempRegionInputPath, options);
+                if (detected.regions.isEmpty()) {
+                    if (rerenderWhiteFrames) {
+                        ViewState.RegionView anchorWorld = new ViewState.RegionView(fullRender.view.targetX,
+                                fullRender.view.targetY, fullRender.view.targetZ, fullRender.view.fieldWidth,
+                                fullRender.view.fieldHeight);
+                        OdGeExtents3d searchWorld = worldExtents(anchorWorld.targetX, anchorWorld.targetY,
+                                anchorWorld.fieldWidth, anchorWorld.fieldHeight, dwgFrameSearchExpandRatio);
 
-            // SpatialAnalyzer.Result vectorAnalysis = SpatialAnalyzer.analyze(database,
-            // 10);
-            // 之前已经分析过了，直接使用结果
-            if (vectorAnalysis.totalExtents == null) {
-                // Fallback (虽然前面已经处理过，但为了逻辑完整)
-                renderRegionToImage(database, dstFileName, width, height, maxResolutionLimit, null);
-                return;
-            }
+                        DwgFrameFinder.Options ffOpt = new DwgFrameFinder.Options();
+                        ffOpt.maxFrames = Math.max(1, whiteFrameMaxFrames);
+                        ffOpt.requireRect = true;
+                        ffOpt.minArea = Math.max(1e-9,
+                                anchorWorld.fieldWidth * anchorWorld.fieldHeight * dwgFrameMinAreaRatio);
 
-            OdGePoint3d worldMin = vectorAnalysis.totalExtents.minPoint();
-            OdGePoint3d worldMax = vectorAnalysis.totalExtents.maxPoint();
-            double worldW = worldMax.getX() - worldMin.getX();
-            double worldH = worldMax.getY() - worldMin.getY();
-
-            // 4. 渲染分块
-            // 为了避免 OOM，我们不将所有 BufferedImage 保存在内存中
-            // 而是记录每个分块的路径和位置信息，最后使用 Graphics2D 逐个绘制到大图（如果大图太大，可能需要分片写文件）
-
-            // 记录分块信息
-            class ImagePart {
-                File file;
-                int x, y, w, h;
-
-                ImagePart(File f, int x, int y, int w, int h) {
-                    this.file = f;
-                    this.x = x;
-                    this.y = y;
-                    this.w = w;
-                    this.h = h;
-                }
-            }
-            List<ImagePart> parts = new ArrayList<>();
-
-            int totalMergedHeight = 0;
-            int maxMergedWidth = 0;
-            int gap = 50;
-
-            // [新增优化] 4.1 过滤离群区域 (Outlier Filtering - Clustering Strategy)
-            // 采用聚类分析：将距离相近的区域归为一类，最后只保留“分数最高”的那一类区域。
-            // 这能有效去除距离主图极远的噪点，解决“内容极小”的问题。
-            if (!pixelRegions.isEmpty()) {
-
-                // [智能过滤] 先去除明显是“大而空”的背景边框/噪点
-                // 策略：如果一个区域面积远大于中位数 (例如 > 3倍)，且密度远低于最大密度 (例如 < 0.6倍)，则视为无效边框
-                if (pixelRegions.size() > 1) {
-                    double maxDensity = 0;
-                    List<Double> areas = new ArrayList<>();
-                    // 先计算 maxDensity 和 medianArea
-                    for (DenseRegionExtractor.Region r : pixelRegions) {
-                        double d = (double) r.score / (r.w * r.h);
-                        if (d > maxDensity)
-                            maxDensity = d;
-                        areas.add((double) r.w * r.h);
-                    }
-
-                    areas.sort(Double::compareTo);
-                    double medianArea = areas.get(areas.size() / 2);
-
-                    List<DenseRegionExtractor.Region> filteredPreCluster = new ArrayList<>();
-                    int removedBigSparse = 0;
-
-                    for (DenseRegionExtractor.Region r : pixelRegions) {
-                        double area = r.w * r.h;
-                        double density = r.score / area;
-
-                        // 条件：面积 > 中位数 * 3 AND 密度 < 最大密度 * 0.6
-                        // 这种区域通常是巨大的空心圆或边框
-                        boolean isHuge = area > medianArea * 3.0;
-                        boolean isSparse = density < maxDensity * 0.6;
-
-                        if (isHuge && isSparse) {
-                            System.out.println(
-                                    "忽略巨大稀疏区域: 尺寸=" + r.w + "x" + r.h + ", 密度=" + String.format("%.4f", density)
-                                            + " (Max: " + String.format("%.4f", maxDensity) + ")");
-                            removedBigSparse++;
-                            continue;
+                        java.util.List<OdGeExtents3d> dwgFrames = DwgFrameFinder.findFrames(database, searchWorld,
+                                ffOpt);
+                        if (dwgFrames.size() < ffOpt.maxFrames) {
+                            DwgFrameFinder.Options relaxed = new DwgFrameFinder.Options();
+                            relaxed.maxFrames = ffOpt.maxFrames;
+                            relaxed.requireRect = false;
+                            relaxed.minArea = ffOpt.minArea * 0.1;
+                            relaxed.maxIouToKeepBoth = ffOpt.maxIouToKeepBoth;
+                            java.util.List<OdGeExtents3d> more = DwgFrameFinder.findFrames(database, searchWorld,
+                                    relaxed);
+                            for (OdGeExtents3d e : more) {
+                                if (dwgFrames.size() >= relaxed.maxFrames) {
+                                    break;
+                                }
+                                dwgFrames.add(e);
+                            }
                         }
-                        filteredPreCluster.add(r);
-                    }
 
-                    if (removedBigSparse > 0) {
-                        if (filteredPreCluster.isEmpty()) {
-                            // 如果全被过滤了，那说明全是垃圾？或者误判了。保留原始的吧。
-                            System.out.println("警告：所有区域都被判定为稀疏噪点，取消过滤，保留原始结果。");
-                        } else {
-                            pixelRegions = filteredPreCluster;
-                            System.out.println("预过滤去除了 " + removedBigSparse + " 个巨大稀疏噪点。");
+                        if (dwgFrameDebugLog) {
+                            System.out.println("DWG外框搜索范围: min=(" + fmt(searchWorld.minPoint().getX()) + ","
+                                    + fmt(searchWorld.minPoint().getY()) + ") max=("
+                                    + fmt(searchWorld.maxPoint().getX()) + "," + fmt(searchWorld.maxPoint().getY())
+                                    + ")");
+                            for (int i = 0; i < dwgFrames.size(); i++) {
+                                OdGeExtents3d e = dwgFrames.get(i);
+                                System.out.println("DWG外框[" + (i + 1) + "]: min=(" + fmt(e.minPoint().getX()) + ","
+                                        + fmt(e.minPoint().getY()) + ") max=(" + fmt(e.maxPoint().getX()) + ","
+                                        + fmt(e.maxPoint().getY()) + ")");
+                            }
+                        }
+
+                        if (!dwgFrames.isEmpty()) {
+                            java.util.List<java.nio.file.Path> frameImages = new java.util.ArrayList<>();
+
+                            String outName = finalOutPath.getFileName().toString();
+                            String baseName = outName.toLowerCase().endsWith(".png")
+                                    ? outName.substring(0, outName.length() - 4)
+                                    : outName;
+
+                            double pxPerWorldX = fullRender.view.fieldWidth <= 0 ? 1.0
+                                    : ((double) fullRender.renderWidth / fullRender.view.fieldWidth);
+                            double pxPerWorldY = fullRender.view.fieldHeight <= 0 ? 1.0
+                                    : ((double) fullRender.renderHeight / fullRender.view.fieldHeight);
+
+                            int idx = 1;
+                            for (OdGeExtents3d e0 : dwgFrames) {
+                                if (idx > whiteFrameMaxFrames) {
+                                    break;
+                                }
+                                OdGeExtents3d e = expandExtents(e0, dwgFrameMarginRatio);
+                                double fw = e.maxPoint().getX() - e.minPoint().getX();
+                                double fh = e.maxPoint().getY() - e.minPoint().getY();
+                                int basePxW = Math.max(1, (int) Math.round(fw * pxPerWorldX));
+                                int basePxH = Math.max(1, (int) Math.round(fh * pxPerWorldY));
+
+                                int[] tileSize = computeRerenderSize(basePxW, basePxH, regionRerenderScale,
+                                        regionRerenderMaxDimension);
+                                int tileW = tileSize[0];
+                                int tileH = tileSize[1];
+
+                                String frameFileName = baseName + "_frame_" + idx + ".png";
+                                java.nio.file.Path frameOutPath = finalOutPath.resolveSibling(frameFileName);
+
+                                java.io.File frameTempFile = new java.io.File(dstFile.getParent(),
+                                        "temp_frame_" + System.currentTimeMillis() + "_" + idx + ".png");
+                                boolean moved = false;
+                                try {
+                                    renderWorldExtentsToImage(database, frameTempFile.getAbsolutePath(), tileW, tileH,
+                                            maxResolutionLimit, fullRender.view, e);
+
+                                    java.nio.file.Files.move(frameTempFile.toPath(), frameOutPath,
+                                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                                    moved = true;
+                                } finally {
+                                    if (!moved) {
+                                        try {
+                                            java.nio.file.Files.deleteIfExists(frameTempFile.toPath());
+                                        } catch (Exception ignored) {
+                                        }
+                                    }
+                                }
+
+                                frameImages.add(frameOutPath);
+                                idx++;
+                            }
+
+                            if (!frameImages.isEmpty()) {
+                                stitchVertically(frameImages, finalOutPath, stitchGap, mergedMaxDimension);
+                                success = true;
+                                System.out.println("DWG外框二次渲染并拼接完成: " + dstFileName);
+
+                                if (!keepRegionImages) {
+                                    for (java.nio.file.Path p : frameImages) {
+                                        try {
+                                            java.nio.file.Files.deleteIfExists(p);
+                                        } catch (Exception ignored) {
+                                        }
+                                    }
+                                }
+                                return;
+                            }
+                        }
+
+                        if (dwgFrameOnly) {
+                            java.nio.file.Files.move(tempRegionInputPath, finalOutPath,
+                                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                            success = true;
+                            System.out.println("未检测到密集区域且未识别到DWG外框，输出全图: " + dstFileName);
+                            return;
                         }
                     }
-                }
 
-                // 1. 初始化聚类
-                List<List<DenseRegionExtractor.Region>> clusters = new ArrayList<>();
-                for (DenseRegionExtractor.Region r : pixelRegions) {
-                    List<DenseRegionExtractor.Region> c = new ArrayList<>();
-                    c.add(r);
-                    clusters.add(c);
-                }
+                    java.nio.file.Files.move(tempRegionInputPath, finalOutPath,
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                    success = true;
+                    System.out.println("未检测到密集区域，输出全图: " + dstFileName);
+                } else {
+                    if (rerenderWhiteFrames) {
+                        DenseRegionExtractor.Region anchor = detected.regions.get(0);
+                        for (DenseRegionExtractor.Region rr : detected.regions) {
+                            if (rr.score > anchor.score) {
+                                anchor = rr;
+                            }
+                        }
 
-                // 2. 合并聚类
-                // 阈值设为代理图尺寸的 ~20% (例如 8192 * 0.2 = 1600)
-                // 如果两个区域的间距超过此值，视为不相关
-                int mergeThreshold = Math.max(proxyW, proxyH) / 5;
-                boolean merged;
-                do {
-                    merged = false;
-                    for (int i = 0; i < clusters.size(); i++) {
-                        if (clusters.get(i).isEmpty())
-                            continue;
-                        for (int j = i + 1; j < clusters.size(); j++) {
-                            if (clusters.get(j).isEmpty())
-                                continue;
+                        ViewState.RegionView anchorWorld = fullRender.view.regionForPixelRect(fullRender.renderWidth,
+                                fullRender.renderHeight,
+                                new java.awt.Rectangle(anchor.x, anchor.y, anchor.w, anchor.h));
+                        OdGeExtents3d searchWorld = worldExtents(anchorWorld.targetX, anchorWorld.targetY,
+                                anchorWorld.fieldWidth, anchorWorld.fieldHeight, dwgFrameSearchExpandRatio);
 
-                            if (shouldMergeClusters(clusters.get(i), clusters.get(j), mergeThreshold)) {
-                                clusters.get(i).addAll(clusters.get(j));
-                                clusters.get(j).clear(); // 标记为空
-                                merged = true;
+                        DwgFrameFinder.Options ffOpt = new DwgFrameFinder.Options();
+                        ffOpt.maxFrames = Math.max(1, whiteFrameMaxFrames);
+                        ffOpt.requireRect = true;
+                        ffOpt.minArea = Math.max(1e-9,
+                                anchorWorld.fieldWidth * anchorWorld.fieldHeight * dwgFrameMinAreaRatio);
+
+                        java.util.List<OdGeExtents3d> dwgFrames = DwgFrameFinder.findFrames(database, searchWorld,
+                                ffOpt);
+                        if (dwgFrames.size() < ffOpt.maxFrames) {
+                            DwgFrameFinder.Options relaxed = new DwgFrameFinder.Options();
+                            relaxed.maxFrames = ffOpt.maxFrames;
+                            relaxed.requireRect = false;
+                            relaxed.minArea = ffOpt.minArea * 0.1;
+                            relaxed.maxIouToKeepBoth = ffOpt.maxIouToKeepBoth;
+                            java.util.List<OdGeExtents3d> more = DwgFrameFinder.findFrames(database, searchWorld,
+                                    relaxed);
+                            for (OdGeExtents3d e : more) {
+                                if (dwgFrames.size() >= relaxed.maxFrames) {
+                                    break;
+                                }
+                                dwgFrames.add(e);
+                            }
+                        }
+
+                        if (dwgFrameDebugLog) {
+                            System.out.println("DWG外框搜索范围: min=(" + fmt(searchWorld.minPoint().getX()) + ","
+                                    + fmt(searchWorld.minPoint().getY()) + ") max=("
+                                    + fmt(searchWorld.maxPoint().getX()) + "," + fmt(searchWorld.maxPoint().getY())
+                                    + ")");
+                            for (int i = 0; i < dwgFrames.size(); i++) {
+                                OdGeExtents3d e = dwgFrames.get(i);
+                                System.out.println("DWG外框[" + (i + 1) + "]: min=(" + fmt(e.minPoint().getX()) + ","
+                                        + fmt(e.minPoint().getY()) + ") max=(" + fmt(e.maxPoint().getX()) + ","
+                                        + fmt(e.maxPoint().getY()) + ")");
+                            }
+                        }
+
+                        if (!dwgFrames.isEmpty()) {
+                            java.util.List<java.nio.file.Path> frameImages = new java.util.ArrayList<>();
+
+                            String outName = finalOutPath.getFileName().toString();
+                            String baseName = outName.toLowerCase().endsWith(".png")
+                                    ? outName.substring(0, outName.length() - 4)
+                                    : outName;
+
+                            double pxPerWorldX = fullRender.view.fieldWidth <= 0 ? 1.0
+                                    : ((double) fullRender.renderWidth / fullRender.view.fieldWidth);
+                            double pxPerWorldY = fullRender.view.fieldHeight <= 0 ? 1.0
+                                    : ((double) fullRender.renderHeight / fullRender.view.fieldHeight);
+
+                            int idx = 1;
+                            for (OdGeExtents3d e0 : dwgFrames) {
+                                if (idx > whiteFrameMaxFrames) {
+                                    break;
+                                }
+                                OdGeExtents3d e = expandExtents(e0, dwgFrameMarginRatio);
+                                double fw = e.maxPoint().getX() - e.minPoint().getX();
+                                double fh = e.maxPoint().getY() - e.minPoint().getY();
+                                int basePxW = Math.max(1, (int) Math.round(fw * pxPerWorldX));
+                                int basePxH = Math.max(1, (int) Math.round(fh * pxPerWorldY));
+
+                                int[] tileSize = computeRerenderSize(basePxW, basePxH, regionRerenderScale,
+                                        regionRerenderMaxDimension);
+                                int tileW = tileSize[0];
+                                int tileH = tileSize[1];
+
+                                String frameFileName = baseName + "_frame_" + idx + ".png";
+                                java.nio.file.Path frameOutPath = finalOutPath.resolveSibling(frameFileName);
+
+                                java.io.File frameTempFile = new java.io.File(dstFile.getParent(),
+                                        "temp_frame_" + System.currentTimeMillis() + "_" + idx + ".png");
+                                boolean moved = false;
+                                try {
+                                    renderWorldExtentsToImage(database, frameTempFile.getAbsolutePath(), tileW, tileH,
+                                            maxResolutionLimit, fullRender.view, e);
+
+                                    java.nio.file.Files.move(frameTempFile.toPath(), frameOutPath,
+                                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                                    moved = true;
+                                } finally {
+                                    if (!moved) {
+                                        try {
+                                            java.nio.file.Files.deleteIfExists(frameTempFile.toPath());
+                                        } catch (Exception ignored) {
+                                        }
+                                    }
+                                }
+
+                                frameImages.add(frameOutPath);
+                                idx++;
+                            }
+
+                            if (!frameImages.isEmpty()) {
+                                stitchVertically(frameImages, finalOutPath, stitchGap, mergedMaxDimension);
+                                success = true;
+                                System.out.println("DWG外框二次渲染并拼接完成: " + dstFileName);
+
+                                if (!keepRegionImages) {
+                                    for (java.nio.file.Path p : frameImages) {
+                                        try {
+                                            java.nio.file.Files.deleteIfExists(p);
+                                        } catch (Exception ignored) {
+                                        }
+                                    }
+                                }
+                                return;
+                            }
+                        }
+                        if (!dwgFrameOnly) {
+                            java.awt.Rectangle search = new java.awt.Rectangle(anchor.x, anchor.y, anchor.w, anchor.h);
+                            int expand = (int) Math
+                                    .round(Math.max(search.width, search.height) * whiteFrameSearchExpandRatio);
+                            if (expand > 0) {
+                                search.grow(expand, expand);
+                            }
+                            search = search.intersection(
+                                    new java.awt.Rectangle(0, 0, fullRender.renderWidth, fullRender.renderHeight));
+
+                            WhiteFrameDetector.Options wfOpt = new WhiteFrameDetector.Options();
+                            wfOpt.maxFrames = Math.max(1, whiteFrameMaxFrames);
+                            wfOpt.grayThreshold = whiteFrameGrayThreshold;
+                            wfOpt.channelDelta = whiteFrameChannelDelta;
+                            wfOpt.minBoxDim = whiteFrameMinBoxDim;
+                            wfOpt.minSideCoverage = whiteFrameMinSideCoverage;
+                            wfOpt.maxInnerCoverage = whiteFrameMaxInnerCoverage;
+                            wfOpt.frameMarginPx = whiteFrameMarginPx;
+
+                            java.util.List<java.awt.Rectangle> frames = WhiteFrameDetector
+                                    .findWhiteFrames(tempRegionInputPath, search, wfOpt);
+
+                            if (whiteFrameDebugLog) {
+                                System.out.println("白框检测锚点: x=" + anchor.x + ",y=" + anchor.y + ",w=" + anchor.w + ",h="
+                                        + anchor.h + ",score=" + String.format("%.6f", anchor.score));
+                                System.out.println("白框搜索范围: x=" + search.x + ",y=" + search.y + ",w=" + search.width
+                                        + ",h=" + search.height);
+                                for (int i = 0; i < frames.size(); i++) {
+                                    java.awt.Rectangle fr = frames.get(i);
+                                    System.out.println("白框[" + (i + 1) + "]: x=" + fr.x + ",y=" + fr.y + ",w="
+                                            + fr.width + ",h=" + fr.height);
+                                }
+                            }
+
+                            if (!frames.isEmpty()) {
+                                java.util.List<java.nio.file.Path> frameImages = new java.util.ArrayList<>();
+
+                                String outName = finalOutPath.getFileName().toString();
+                                String baseName = outName.toLowerCase().endsWith(".png")
+                                        ? outName.substring(0, outName.length() - 4)
+                                        : outName;
+
+                                int idx = 1;
+                                for (java.awt.Rectangle rect : frames) {
+                                    int[] tileSize = computeRerenderSize(rect.width, rect.height, regionRerenderScale,
+                                            regionRerenderMaxDimension);
+                                    int tileW = tileSize[0];
+                                    int tileH = tileSize[1];
+
+                                    String frameFileName = baseName + "_frame_" + idx + ".png";
+                                    java.nio.file.Path frameOutPath = finalOutPath.resolveSibling(frameFileName);
+
+                                    java.io.File frameTempFile = new java.io.File(dstFile.getParent(),
+                                            "temp_frame_" + System.currentTimeMillis() + "_" + idx + ".png");
+                                    boolean moved = false;
+                                    try {
+                                        renderRegionToImage(database, frameTempFile.getAbsolutePath(), tileW, tileH,
+                                                maxResolutionLimit, fullRender.view, fullRender.renderWidth,
+                                                fullRender.renderHeight, rect);
+
+                                        java.nio.file.Files.move(frameTempFile.toPath(), frameOutPath,
+                                                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                                        moved = true;
+                                    } finally {
+                                        if (!moved) {
+                                            try {
+                                                java.nio.file.Files.deleteIfExists(frameTempFile.toPath());
+                                            } catch (Exception ignored) {
+                                            }
+                                        }
+                                    }
+
+                                    frameImages.add(frameOutPath);
+                                    idx++;
+                                }
+
+                                stitchVertically(frameImages, finalOutPath, stitchGap, mergedMaxDimension);
+                                success = true;
+                                System.out.println("白框二次渲染并拼接完成: " + dstFileName);
+
+                                if (!keepRegionImages) {
+                                    for (java.nio.file.Path p : frameImages) {
+                                        try {
+                                            java.nio.file.Files.deleteIfExists(p);
+                                        } catch (Exception ignored) {
+                                        }
+                                    }
+                                }
+                                return;
                             }
                         }
                     }
-                    // 移除空聚类
-                    clusters.removeIf(List::isEmpty);
-                } while (merged);
 
-                // 3. 找出所有显著的聚类 (分数 > 10% MaxScore 且 面积 > 2% MaxArea)
-                // 之前的策略只保留 Top 1，导致误删有效内容。
-                // 现在的策略：结合“分数”和“空间面积”双重过滤。
-                // 噪点通常具有：低分数 OR (高密度但极小面积)。
-                double maxClusterScore = 0;
-                double maxClusterArea = 0;
+                    java.util.List<java.nio.file.Path> regionImages = new java.util.ArrayList<>();
 
-                // 预计算每个簇的属性
-                List<Double> clusterScores = new ArrayList<>();
-                List<Double> clusterAreas = new ArrayList<>();
+                    String outName = finalOutPath.getFileName().toString();
+                    String baseName = outName.toLowerCase().endsWith(".png")
+                            ? outName.substring(0, outName.length() - 4)
+                            : outName;
 
-                for (List<DenseRegionExtractor.Region> cluster : clusters) {
-                    double score = 0;
-                    double minX = Double.MAX_VALUE, minY = Double.MAX_VALUE;
-                    double maxX = -Double.MAX_VALUE, maxY = -Double.MAX_VALUE;
+                    int idx = 1;
+                    for (DenseRegionExtractor.Region r : detected.regions) {
+                        java.awt.Rectangle rect = new java.awt.Rectangle(r.x, r.y, r.w, r.h);
+                        int margin = (int) Math.round(Math.max(rect.width, rect.height) * regionMarginRatio);
+                        if (margin > 0) {
+                            rect.grow(margin, margin);
+                        }
+                        rect = rect.intersection(
+                                new java.awt.Rectangle(0, 0, fullRender.renderWidth, fullRender.renderHeight));
+                        if (rect.isEmpty()) {
+                            continue;
+                        }
 
-                    for (DenseRegionExtractor.Region r : cluster) {
-                        score += r.score;
-                        minX = Math.min(minX, r.x);
-                        minY = Math.min(minY, r.y);
-                        maxX = Math.max(maxX, r.x + r.w);
-                        maxY = Math.max(maxY, r.y + r.h);
-                    }
-                    double area = (maxX - minX) * (maxY - minY);
+                        int[] tileSize = computeRerenderSize(rect.width, rect.height, regionRerenderScale,
+                                regionRerenderMaxDimension);
+                        int tileW = tileSize[0];
+                        int tileH = tileSize[1];
 
-                    clusterScores.add(score);
-                    clusterAreas.add(area);
+                        String regionFileName = baseName + "_region_" + idx + ".png";
+                        java.nio.file.Path regionOutPath = finalOutPath.resolveSibling(regionFileName);
 
-                    if (score > maxClusterScore)
-                        maxClusterScore = score;
-                    if (area > maxClusterArea)
-                        maxClusterArea = area;
-                }
+                        java.io.File regionTempFile = new java.io.File(dstFile.getParent(),
+                                "temp_region_" + System.currentTimeMillis() + "_" + idx + ".png");
+                        boolean moved = false;
+                        try {
+                            renderRegionToImage(database, regionTempFile.getAbsolutePath(), tileW, tileH,
+                                    maxResolutionLimit, fullRender.view, fullRender.renderWidth,
+                                    fullRender.renderHeight, rect);
 
-                List<DenseRegionExtractor.Region> keptRegions = new ArrayList<>();
-                System.out.println("发现 " + clusters.size() + " 个独立的区域簇 (最大分: " + String.format("%.2f", maxClusterScore)
-                        + ", 最大面积: " + String.format("%.0f", maxClusterArea) + "):");
-
-                for (int i = 0; i < clusters.size(); i++) {
-                    List<DenseRegionExtractor.Region> cluster = clusters.get(i);
-                    double score = clusterScores.get(i);
-                    double area = clusterAreas.get(i);
-
-                    // 阈值判定
-                    // 1. 分数至少为最大簇的 10% (保留主要内容)
-                    // 2. 面积至少为最大簇的 2% (过滤高密度但微小的噪点/图章)
-                    boolean enoughScore = score > maxClusterScore * 0.1;
-                    boolean enoughArea = area > maxClusterArea * 0.02;
-
-                    // 特殊情况：如果只有一个簇，无条件保留
-                    boolean keep = (clusters.size() == 1) || (enoughScore && enoughArea);
-
-                    String status = keep ? "保留" : "过滤";
-                    String reason = "";
-                    if (!keep) {
-                        if (!enoughScore)
-                            reason += "[分数过低] ";
-                        if (!enoughArea)
-                            reason += "[面积过小] ";
-                    }
-
-                    System.out.println(
-                            "  簇 " + (i + 1) + ": 包含 " + cluster.size() + " 个区域, 总分=" + String.format("%.2f", score) +
-                                    ", 面积=" + String.format("%.0f", area) + " ("
-                                    + String.format("%.1f", (maxClusterArea > 0 ? (area / maxClusterArea) * 100 : 0))
-                                    + "%) -> " + status + " " + reason);
-
-                    if (keep) {
-                        keptRegions.addAll(cluster);
-                    }
-                }
-
-                // 4. 应用过滤
-                if (!keptRegions.isEmpty()) {
-                    int removedCount = pixelRegions.size() - keptRegions.size();
-                    if (removedCount > 0) {
-                        System.out.println(
-                                ">>> 过滤了 " + removedCount + " 个离群/噪点区域，保留了 " + keptRegions.size() + " 个有效区域 <<<");
-                        pixelRegions = keptRegions;
-                    }
-                }
-            }
-
-            // [新增优化] 计算所有密集区域的世界坐标包围盒
-            // 如果图纸有极远的噪点，直接用 worldW/worldH 会导致 scale 极小。
-            // 我们应该只根据“有效密集区域”的范围来计算缩放比例。
-            double denseMinX = Double.MAX_VALUE;
-            double denseMinY = Double.MAX_VALUE;
-            double denseMaxX = -Double.MAX_VALUE;
-            double denseMaxY = -Double.MAX_VALUE;
-
-            for (DenseRegionExtractor.Region r : pixelRegions) {
-                double normX = (double) r.x / proxyW;
-                double normY = (double) r.y / proxyH;
-                double normW = (double) r.w / proxyW;
-                double normH = (double) r.h / proxyH;
-
-                double rMinX = worldMin.getX() + normX * worldW;
-                double rMaxX = rMinX + normW * worldW;
-
-                // Y axis flip
-                double rMaxY = worldMax.getY() - normY * worldH;
-                double rMinY = rMaxY - normH * worldH;
-
-                if (rMinX < denseMinX)
-                    denseMinX = rMinX;
-                if (rMinY < denseMinY)
-                    denseMinY = rMinY;
-                if (rMaxX > denseMaxX)
-                    denseMaxX = rMaxX;
-                if (rMaxY > denseMaxY)
-                    denseMaxY = rMaxY;
-            }
-
-            double denseWorldW = denseMaxX - denseMinX;
-            double denseWorldH = denseMaxY - denseMinY;
-
-            // 防止除零或无效区域
-            if (denseWorldW <= 0 || denseWorldH <= 0) {
-                denseWorldW = worldW;
-                denseWorldH = worldH;
-            }
-
-            // 计算全局缩放比例 (基于密集区域的包围盒)
-            double scaleX = (double) width / denseWorldW;
-            double scaleY = (double) height / denseWorldH;
-            double globalScale = Math.min(scaleX, scaleY);
-
-            System.out.println("有效内容范围: " + denseWorldW + "x" + denseWorldH + " (原始范围: " + worldW + "x" + worldH + ")");
-            System.out.println("全局缩放比例: " + String.format("%.4f", globalScale));
-
-            for (int i = 0; i < pixelRegions.size(); i++) {
-                DenseRegionExtractor.Region r = pixelRegions.get(i);
-
-                // Map Pixel (r.x, r.y, r.w, r.h) from Proxy (proxyW, proxyH) to World
-                // Image Origin (0,0) is usually Top-Left.
-                // World Y is usually Bottom-Up.
-                // So Pixel Y maps to World Y: worldMaxY - (y / pH) * worldH
-
-                double normX = (double) r.x / proxyW;
-                double normY = (double) r.y / proxyH;
-                double normW = (double) r.w / proxyW;
-                double normH = (double) r.h / proxyH;
-
-                double regMinX = worldMin.getX() + normX * worldW;
-                double regMaxX = regMinX + normW * worldW;
-
-                // Y axis flip
-                // Pixel y=0 -> World MaxY
-                // Pixel y+h -> World MaxY - ...
-                double regMaxY = worldMax.getY() - normY * worldH;
-                double regMinY = regMaxY - normH * worldH;
-
-                OdGeExtents3d regionExt = new OdGeExtents3d(
-                        new OdGePoint3d(regMinX, regMinY, 0),
-                        new OdGePoint3d(regMaxX, regMaxY, 0));
-
-                // Calculate Target Output Size
-                int pW = (int) Math.ceil((regMaxX - regMinX) * globalScale);
-                int pH = (int) Math.ceil((regMaxY - regMinY) * globalScale);
-
-                pW = Math.max(1, pW);
-                pH = Math.max(1, pH);
-
-                System.out.println("渲染区域 " + (i + 1) + ": " + pW + "x" + pH);
-
-                String tempName = "temp_part_" + System.currentTimeMillis() + "_" + i + ".png";
-                java.io.File tempPart = new java.io.File(parentDir, tempName);
-
-                try {
-                    renderRegionToImage(database, tempPart.getAbsolutePath(), pW, pH, maxResolutionLimit, regionExt);
-                    if (tempPart.exists()) {
-                        // 验证是否成功生成，且是有效图片
-                        try (FileInputStream fis = new FileInputStream(tempPart)) {
-                            // 只读头信息，不加载整个图片
-                            // 不过为了获取宽高，可能还是得 ImageIO.read 部分
-                            // 简单起见，这里假设生成就是成功的，直接记录
-                            // 为了获取真实宽高 (可能被 ODA 内部调整)，还是得读一下头
-                            // 或者直接用我们请求的 pW, pH (如果 ODA 没改的话)
-
-                            // 为了稳妥，读一下图片对象，获取宽高后立即释放
-                            BufferedImage part = ImageIO.read(tempPart);
-                            if (part != null) {
-                                int partW = part.getWidth();
-                                int partH = part.getHeight();
-                                parts.add(new ImagePart(tempPart, 0, 0, partW, partH));
-                                totalMergedHeight += partH + gap;
-                                maxMergedWidth = Math.max(maxMergedWidth, partW);
-                                // 不要 delete tempPart，后面合并要用
+                            java.nio.file.Files.move(regionTempFile.toPath(), regionOutPath,
+                                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                            moved = true;
+                        } finally {
+                            if (!moved) {
+                                try {
+                                    java.nio.file.Files.deleteIfExists(regionTempFile.toPath());
+                                } catch (Exception ignored) {
+                                }
                             }
-                            // part = null; // Help GC
+                        }
+
+                        regionImages.add(regionOutPath);
+                        idx++;
+                    }
+
+                    if (regionImages.isEmpty()) {
+                        java.nio.file.Files.move(tempRegionInputPath, finalOutPath,
+                                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                        success = true;
+                        System.out.println("区域渲染跳过（无有效区域），输出全图: " + dstFileName);
+                    } else {
+                        stitchVertically(regionImages, finalOutPath, stitchGap, mergedMaxDimension);
+                        success = true;
+                        System.out.println("区域二次渲染并拼接完成: " + dstFileName);
+                    }
+
+                    if (!keepRegionImages) {
+                        for (java.nio.file.Path p : regionImages) {
+                            try {
+                                java.nio.file.Files.deleteIfExists(p);
+                            } catch (Exception ignored) {
+                            }
                         }
                     }
-                } catch (Exception ex) {
-                    ex.printStackTrace();
                 }
             }
-
-            if (parts.isEmpty()) {
-                System.out.println("区域渲染失败");
-                return;
-            }
-
-            totalMergedHeight -= gap;
-
-            System.out.println("正在合并图片: " + maxMergedWidth + "x" + totalMergedHeight);
-
-            // 如果图片非常大 (例如超过 2GB 内存)，BufferedImage 可能会失败
-            // Java 数组最大索引是 Integer.MAX_VALUE (21亿)，但 RGBA 占 4 字节，所以最大像素数约为 5亿 (23000x23000)
-            // 30000x20000 = 6亿像素，肯定会爆 BufferedImage。
-
-            // 解决方案：如果不缩放，就无法生成单一文件 (PNG 限制)。
-            // 除非使用 BigBufferedImage (基于磁盘)，或者分块保存。
-            // 这里我们尝试：如果尺寸过大，就强制缩放输出图片到安全范围 (例如最长边 20000)
-
-            int safeMaxDim = 20000;
-            double outputScale = 1.0;
-            if (maxMergedWidth > safeMaxDim || totalMergedHeight > safeMaxDim) {
-                double sx = (double) safeMaxDim / maxMergedWidth;
-                double sy = (double) safeMaxDim / totalMergedHeight;
-                outputScale = Math.min(sx, sy);
-                System.out.println(
-                        "输出尺寸过大，将自动缩放至安全范围 (" + safeMaxDim + "px)，缩放比例: " + String.format("%.4f", outputScale));
-
-                maxMergedWidth = (int) (maxMergedWidth * outputScale);
-                totalMergedHeight = (int) (totalMergedHeight * outputScale);
-                System.out.println("最终输出尺寸: " + maxMergedWidth + "x" + totalMergedHeight);
-            }
-
-            BufferedImage finalImage = new BufferedImage(maxMergedWidth, totalMergedHeight,
-                    BufferedImage.TYPE_INT_ARGB);
-            Graphics2D g = finalImage.createGraphics();
-
-            // 优化：设置更好的插值算法
-            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-
-            int currentY = 0;
-            for (ImagePart part : parts) {
-                BufferedImage chunk = ImageIO.read(part.file);
-                if (chunk != null) {
-                    int targetW = (int) (part.w * outputScale);
-                    int targetH = (int) (part.h * outputScale);
-
-                    int drawX = (maxMergedWidth - targetW) / 2;
-                    g.drawImage(chunk, drawX, currentY, targetW, targetH, null);
-                    currentY += targetH + (int) (gap * outputScale);
-
-                    // 释放内存
-                    chunk = null;
-                }
-                // 删除临时文件
-                part.file.delete();
-            }
-            g.dispose();
-
-            ImageIO.write(finalImage, "png", dstFile);
-            System.out.println("处理完成: " + dstFileName);
-
         } catch (Exception e) {
+            System.err.println("密集区域提取过程中发生错误: " + e.getMessage());
             e.printStackTrace();
+            throw new RuntimeException(e);
+        } finally {
+            if (success) {
+                // 成功则清理临时全图
+                if (!keepFullImage) {
+                    try {
+                        java.nio.file.Files.deleteIfExists(tempRegionInputPath);
+                    } catch (IOException ignored) {
+                    }
+                }
+            } else {
+                // 如果失败，尝试恢复原图 (从 tempRegionInputPath 移动回 finalOutPath)
+                System.err.println("正在恢复原图...");
+                try {
+                    if (java.nio.file.Files.exists(tempRegionInputPath)) {
+                        java.nio.file.Files.move(tempRegionInputPath, finalOutPath,
+                                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                    }
+                } catch (Exception restoreEx) {
+                    System.err.println("无法恢复原图: " + restoreEx.getMessage());
+                }
+            }
         }
     }
 
-    private static void renderRegionToImage(OdDbDatabase database, String outputFile, int width, int height,
-            int maxResolutionLimit, OdGeExtents3d region) {
+    private static RenderResult renderToImage(OdDbDatabase database, String outputFile, int width, int height,
+            int maxResolutionLimit) {
         MemoryTransaction transaction = MemoryManager.GetMemoryManager().StartTransaction();
         try {
-            // Force limit max resolution per part to 20000 to avoid OOM
-            int safeLimit = Math.min(maxResolutionLimit, 20000);
-            int[] size = normalizeRenderSize(width, height, safeLimit);
+            int[] size = normalizeRenderSize(width, height, maxResolutionLimit);
             int renderWidth = size[0];
             int renderHeight = size[1];
-
-            // 如果尺寸被缩放了，说明触发了分辨率限制
             if (renderWidth != width || renderHeight != height) {
-                // System.out.println("区域尺寸已自动缩放为: " + renderWidth + "x" + renderHeight);
+                System.out.println("渲染尺寸过大，已自动缩放为: " + renderWidth + "x" + renderHeight);
             }
 
             OdGsModule gsModule = loadGsModuleWithFallback(renderWidth > 8192 || renderHeight > 8192);
@@ -670,30 +731,55 @@ public class DwgToPng {
             device.onSize(new OdGsDCRect(new OdGsDCPoint(0, renderHeight), new OdGsDCPoint(renderWidth, 0)));
 
             OdGsView view = device.viewAt(0);
+            OdAbstractViewPE viewPE = OdAbstractViewPE.cast(view);
+            viewPE.zoomExtents(view);
 
-            if (region != null) {
-                OdGePoint3d min = region.minPoint();
-                OdGePoint3d max = region.maxPoint();
+            ViewState state = ViewState.fromView(view, renderWidth, renderHeight);
 
-                double w = Math.abs(max.getX() - min.getX());
-                double h = Math.abs(max.getY() - min.getY());
+            device.update();
 
-                // 计算中心点
-                OdGePoint3d center = new OdGePoint3d(
-                        (min.getX() + max.getX()) / 2.0,
-                        (min.getY() + max.getY()) / 2.0,
-                        (min.getZ() + max.getZ()) / 2.0);
-
-                // 设置视图：目标在 center，相机在 center + Z，上方向为 Y
-                OdGePoint3d position = new OdGePoint3d(center.getX(), center.getY(), center.getZ() + 1.0);
-                OdGeVector3d upVector = new OdGeVector3d(0, 1, 0);
-
-                // 使用 setView 设置正交投影
-                view.setView(position, center, upVector, w, h, OdGsView_Projection.kParallel);
-            } else {
-                OdAbstractViewPE viewPE = OdAbstractViewPE.cast(view);
-                viewPE.zoomExtents(view);
+            OdGiRasterImage image = OdGiRasterImage.cast(device.properties().getAt("RasterImage"));
+            OdRxRasterServices rasterServices = OdRxRasterServices
+                    .cast(TD_RootIntegrated_Globals.odrxDynamicLinker().loadApp("RxRasterServices"));
+            if (rasterServices != null) {
+                rasterServices.saveRasterImage(image, outputFile, new long[] { 0 });
             }
+            return new RenderResult(renderWidth, renderHeight, state);
+        } finally {
+            MemoryManager.GetMemoryManager().StopTransaction(transaction);
+        }
+    }
+
+    private static void renderRegionToImage(OdDbDatabase database, String outputFile, int width, int height,
+            int maxResolutionLimit, ViewState baseView, int basePixelWidth, int basePixelHeight,
+            java.awt.Rectangle pixelRect) {
+        MemoryTransaction transaction = MemoryManager.GetMemoryManager().StartTransaction();
+        try {
+            int[] size = normalizeRenderSize(width, height, maxResolutionLimit);
+            int renderWidth = size[0];
+            int renderHeight = size[1];
+
+            OdGsModule gsModule = loadGsModuleWithFallback(renderWidth > 8192 || renderHeight > 8192);
+            OdGsDevice device = gsModule.createBitmapDevice();
+            OdGiContextForDbDatabase context = OdGiContextForDbDatabase.createObject();
+
+            context.setDatabase(database);
+            context.enableGsModel(true);
+            context.setPlotGeneration(true);
+
+            device = TD_DbCoreIntegrated_Globals.OdDbGsManager_setupActiveLayoutViews(device, context);
+            long[] palette = TD_RootIntegrated_Globals.odcmAcadDarkPalette();
+            device.setLogicalPalette(palette, 256);
+            device.setBackgroundColor(0);
+            context.setPaletteBackground(0);
+
+            device.onSize(new OdGsDCRect(new OdGsDCPoint(0, renderHeight), new OdGsDCPoint(renderWidth, 0)));
+
+            OdGsView view = device.viewAt(0);
+            baseView.applyTo(view);
+
+            ViewState.RegionView rv = baseView.regionForPixelRect(basePixelWidth, basePixelHeight, pixelRect);
+            rv.applyTo(view, baseView);
 
             device.update();
 
@@ -705,6 +791,298 @@ public class DwgToPng {
             }
         } finally {
             MemoryManager.GetMemoryManager().StopTransaction(transaction);
+        }
+    }
+
+    private static void renderWorldExtentsToImage(OdDbDatabase database, String outputFile, int width, int height,
+            int maxResolutionLimit, ViewState baseView, OdGeExtents3d worldExtents) {
+        MemoryTransaction transaction = MemoryManager.GetMemoryManager().StartTransaction();
+        try {
+            int[] size = normalizeRenderSize(width, height, maxResolutionLimit);
+            int renderWidth = size[0];
+            int renderHeight = size[1];
+
+            OdGsModule gsModule = loadGsModuleWithFallback(renderWidth > 8192 || renderHeight > 8192);
+            OdGsDevice device = gsModule.createBitmapDevice();
+            OdGiContextForDbDatabase context = OdGiContextForDbDatabase.createObject();
+
+            context.setDatabase(database);
+            context.enableGsModel(true);
+            context.setPlotGeneration(true);
+
+            device = TD_DbCoreIntegrated_Globals.OdDbGsManager_setupActiveLayoutViews(device, context);
+            long[] palette = TD_RootIntegrated_Globals.odcmAcadDarkPalette();
+            device.setLogicalPalette(palette, 256);
+            device.setBackgroundColor(0);
+            context.setPaletteBackground(0);
+
+            device.onSize(new OdGsDCRect(new OdGsDCPoint(0, renderHeight), new OdGsDCPoint(renderWidth, 0)));
+
+            OdGsView view = device.viewAt(0);
+            baseView.applyTo(view);
+
+            double minX = worldExtents.minPoint().getX();
+            double minY = worldExtents.minPoint().getY();
+            double maxX = worldExtents.maxPoint().getX();
+            double maxY = worldExtents.maxPoint().getY();
+            double cx = (minX + maxX) * 0.5;
+            double cy = (minY + maxY) * 0.5;
+            double fw = Math.max(1e-9, maxX - minX);
+            double fh = Math.max(1e-9, maxY - minY);
+
+            ViewState.RegionView rv = new ViewState.RegionView(cx, cy, 0.0, fw, fh);
+            rv.applyTo(view, baseView);
+
+            device.update();
+
+            OdGiRasterImage image = OdGiRasterImage.cast(device.properties().getAt("RasterImage"));
+            OdRxRasterServices rasterServices = OdRxRasterServices
+                    .cast(TD_RootIntegrated_Globals.odrxDynamicLinker().loadApp("RxRasterServices"));
+            if (rasterServices != null) {
+                rasterServices.saveRasterImage(image, outputFile, new long[] { 0 });
+            }
+        } finally {
+            MemoryManager.GetMemoryManager().StopTransaction(transaction);
+        }
+    }
+
+    private static OdGeExtents3d worldExtents(double centerX, double centerY, double fieldWidth, double fieldHeight,
+            double expandRatio) {
+        double hw = fieldWidth * 0.5;
+        double hh = fieldHeight * 0.5;
+        double ex = Math.max(0.0, fieldWidth * Math.max(0.0, expandRatio));
+        double ey = Math.max(0.0, fieldHeight * Math.max(0.0, expandRatio));
+        double minX = centerX - hw - ex;
+        double maxX = centerX + hw + ex;
+        double minY = centerY - hh - ey;
+        double maxY = centerY + hh + ey;
+        return new OdGeExtents3d(new OdGePoint3d(minX, minY, 0), new OdGePoint3d(maxX, maxY, 0));
+    }
+
+    private static OdGeExtents3d expandExtents(OdGeExtents3d e, double marginRatio) {
+        double minX = e.minPoint().getX();
+        double minY = e.minPoint().getY();
+        double maxX = e.maxPoint().getX();
+        double maxY = e.maxPoint().getY();
+        double w = maxX - minX;
+        double h = maxY - minY;
+        double mx = Math.max(0.0, w * Math.max(0.0, marginRatio));
+        double my = Math.max(0.0, h * Math.max(0.0, marginRatio));
+        return new OdGeExtents3d(new OdGePoint3d(minX - mx, minY - my, 0), new OdGePoint3d(maxX + mx, maxY + my, 0));
+    }
+
+    private static String fmt(double v) {
+        return String.format("%.3f", v);
+    }
+
+    private static int[] computeRerenderSize(int baseW, int baseH, double scale, int maxDim) {
+        int w = Math.max(1, (int) Math.round(Math.max(1.0, scale) * (double) Math.max(1, baseW)));
+        int h = Math.max(1, (int) Math.round(Math.max(1.0, scale) * (double) Math.max(1, baseH)));
+        if (maxDim > 0 && (w > maxDim || h > maxDim)) {
+            double s = Math.min((double) maxDim / (double) w, (double) maxDim / (double) h);
+            w = Math.max(1, (int) Math.floor(w * s));
+            h = Math.max(1, (int) Math.floor(h * s));
+        }
+        return new int[] { w, h };
+    }
+
+    private static void stitchVertically(java.util.List<java.nio.file.Path> regionPngs, java.nio.file.Path outPng,
+            int gap, int maxDim) throws IOException {
+        java.util.List<java.awt.image.BufferedImage> images = new java.util.ArrayList<>();
+        int maxW = 0;
+        int totalH = 0;
+        for (java.nio.file.Path p : regionPngs) {
+            java.awt.image.BufferedImage img = javax.imageio.ImageIO.read(p.toFile());
+            if (img == null) {
+                continue;
+            }
+            images.add(img);
+            maxW = Math.max(maxW, img.getWidth());
+            totalH += img.getHeight();
+        }
+
+        if (images.isEmpty()) {
+            return;
+        }
+
+        totalH += gap * Math.max(0, images.size() - 1);
+
+        double scale = 1.0;
+        if (maxDim > 0) {
+            if (maxW > maxDim || totalH > maxDim) {
+                scale = Math.min((double) maxDim / (double) maxW, (double) maxDim / (double) totalH);
+                scale = Math.max(0.01, Math.min(1.0, scale));
+            }
+        }
+
+        int outW = Math.max(1, (int) Math.floor(maxW * scale));
+        int outH = Math.max(1, (int) Math.floor(totalH * scale));
+
+        java.awt.image.BufferedImage merged = new java.awt.image.BufferedImage(outW, outH,
+                java.awt.image.BufferedImage.TYPE_INT_ARGB);
+        java.awt.Graphics2D g = merged.createGraphics();
+        try {
+            g.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION,
+                    java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            g.setRenderingHint(java.awt.RenderingHints.KEY_RENDERING, java.awt.RenderingHints.VALUE_RENDER_QUALITY);
+
+            int y = 0;
+            int scaledGap = (int) Math.round(gap * scale);
+            for (java.awt.image.BufferedImage img : images) {
+                int sw = Math.max(1, (int) Math.floor(img.getWidth() * scale));
+                int sh = Math.max(1, (int) Math.floor(img.getHeight() * scale));
+                int x = (outW - sw) / 2;
+                g.drawImage(img, x, y, sw, sh, null);
+                y += sh + scaledGap;
+            }
+        } finally {
+            g.dispose();
+        }
+        javax.imageio.ImageIO.write(merged, "png", outPng.toFile());
+    }
+
+    private static final class RenderResult {
+        public final int renderWidth;
+        public final int renderHeight;
+        public final ViewState view;
+
+        private RenderResult(int renderWidth, int renderHeight, ViewState view) {
+            this.renderWidth = renderWidth;
+            this.renderHeight = renderHeight;
+            this.view = view;
+        }
+    }
+
+    private static final class ViewState {
+        public final double posX;
+        public final double posY;
+        public final double posZ;
+        public final double targetX;
+        public final double targetY;
+        public final double targetZ;
+        public final double upX;
+        public final double upY;
+        public final double upZ;
+        public final double viewDirX;
+        public final double viewDirY;
+        public final double viewDirZ;
+        public final double rightX;
+        public final double rightY;
+        public final double rightZ;
+        public final double upViewX;
+        public final double upViewY;
+        public final double upViewZ;
+        public final double distance;
+        public final double fieldWidth;
+        public final double fieldHeight;
+        public final OdGsView_Projection projection;
+        public final int pixelWidth;
+        public final int pixelHeight;
+
+        private ViewState(double posX, double posY, double posZ, double targetX, double targetY, double targetZ,
+                double upX, double upY, double upZ, double viewDirX, double viewDirY, double viewDirZ, double rightX,
+                double rightY, double rightZ, double upViewX, double upViewY, double upViewZ, double distance,
+                double fieldWidth, double fieldHeight, OdGsView_Projection projection, int pixelWidth,
+                int pixelHeight) {
+            this.posX = posX;
+            this.posY = posY;
+            this.posZ = posZ;
+            this.targetX = targetX;
+            this.targetY = targetY;
+            this.targetZ = targetZ;
+            this.upX = upX;
+            this.upY = upY;
+            this.upZ = upZ;
+            this.viewDirX = viewDirX;
+            this.viewDirY = viewDirY;
+            this.viewDirZ = viewDirZ;
+            this.rightX = rightX;
+            this.rightY = rightY;
+            this.rightZ = rightZ;
+            this.upViewX = upViewX;
+            this.upViewY = upViewY;
+            this.upViewZ = upViewZ;
+            this.distance = distance;
+            this.fieldWidth = fieldWidth;
+            this.fieldHeight = fieldHeight;
+            this.projection = projection;
+            this.pixelWidth = pixelWidth;
+            this.pixelHeight = pixelHeight;
+        }
+
+        public static ViewState fromView(OdGsView view, int pixelWidth, int pixelHeight) {
+            OdGePoint3d pos = view.position();
+            OdGePoint3d target = view.target();
+            OdGeVector3d up = view.upVector();
+
+            OdGeVector3d viewDir = target.subtract(pos).normalize();
+            OdGeVector3d right = viewDir.crossProduct(up).normalize();
+            OdGeVector3d upView = right.crossProduct(viewDir).normalize();
+
+            double dist = pos.distanceTo(target);
+
+            OdGsView_Projection proj = view.isPerspective() ? OdGsView_Projection.kPerspective
+                    : OdGsView_Projection.kParallel;
+
+            return new ViewState(pos.getX(), pos.getY(), pos.getZ(), target.getX(), target.getY(), target.getZ(),
+                    up.getX(), up.getY(), up.getZ(), viewDir.getX(), viewDir.getY(), viewDir.getZ(), right.getX(),
+                    right.getY(), right.getZ(), upView.getX(), upView.getY(), upView.getZ(), dist, view.fieldWidth(),
+                    view.fieldHeight(), proj, pixelWidth, pixelHeight);
+        }
+
+        public void applyTo(OdGsView view) {
+            view.setView(new OdGePoint3d(posX, posY, posZ), new OdGePoint3d(targetX, targetY, targetZ),
+                    new OdGeVector3d(upX, upY, upZ), fieldWidth, fieldHeight, projection);
+        }
+
+        public RegionView regionForPixelRect(int basePixelWidth, int basePixelHeight, java.awt.Rectangle rect) {
+            int pw = basePixelWidth <= 0 ? pixelWidth : basePixelWidth;
+            int ph = basePixelHeight <= 0 ? pixelHeight : basePixelHeight;
+
+            double u0 = ((double) rect.x / (double) pw) - 0.5;
+            double u1 = ((double) (rect.x + rect.width) / (double) pw) - 0.5;
+            double v0 = 0.5 - ((double) rect.y / (double) ph);
+            double v1 = 0.5 - ((double) (rect.y + rect.height) / (double) ph);
+
+            double uCenter = (u0 + u1) * 0.5;
+            double vCenter = (v0 + v1) * 0.5;
+
+            double dx = uCenter * fieldWidth;
+            double dy = vCenter * fieldHeight;
+
+            double centerX = targetX + rightX * dx + upViewX * dy;
+            double centerY = targetY + rightY * dx + upViewY * dy;
+            double centerZ = targetZ + rightZ * dx + upViewZ * dy;
+
+            double rw = Math.max(1e-9, Math.abs(u1 - u0) * fieldWidth);
+            double rh = Math.max(1e-9, Math.abs(v0 - v1) * fieldHeight);
+
+            return new RegionView(centerX, centerY, centerZ, rw, rh);
+        }
+
+        public static final class RegionView {
+            public final double targetX;
+            public final double targetY;
+            public final double targetZ;
+            public final double fieldWidth;
+            public final double fieldHeight;
+
+            private RegionView(double targetX, double targetY, double targetZ, double fieldWidth, double fieldHeight) {
+                this.targetX = targetX;
+                this.targetY = targetY;
+                this.targetZ = targetZ;
+                this.fieldWidth = fieldWidth;
+                this.fieldHeight = fieldHeight;
+            }
+
+            public void applyTo(OdGsView view, ViewState base) {
+                double posX = targetX - base.viewDirX * base.distance;
+                double posY = targetY - base.viewDirY * base.distance;
+                double posZ = targetZ - base.viewDirZ * base.distance;
+
+                view.setView(new OdGePoint3d(posX, posY, posZ), new OdGePoint3d(targetX, targetY, targetZ),
+                        new OdGeVector3d(base.upX, base.upY, base.upZ), fieldWidth, fieldHeight, base.projection);
+            }
         }
     }
 
@@ -839,28 +1217,5 @@ public class DwgToPng {
         public CustomSystemServices() {
             TD_RootIntegrated_Globals.odActivate(OdActivationInfo.userInfo, OdActivationInfo.userSignature);
         }
-    }
-
-    private static boolean shouldMergeClusters(List<DenseRegionExtractor.Region> c1,
-            List<DenseRegionExtractor.Region> c2, int threshold) {
-        for (DenseRegionExtractor.Region r1 : c1) {
-            for (DenseRegionExtractor.Region r2 : c2) {
-                if (getRegionDistance(r1, r2) < threshold) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    private static double getRegionDistance(DenseRegionExtractor.Region r1, DenseRegionExtractor.Region r2) {
-        // Calculate gap between rectangles
-        // max(r1.right, r2.right) - min(r1.left, r2.left) - r1.width - r2.width
-        // If overlap, result is negative. max(0, result) gives 0.
-        int left = Math.max(r1.x + r1.w, r2.x + r2.w) - Math.min(r1.x, r2.x) - r1.w - r2.w;
-        int top = Math.max(r1.y + r1.h, r2.y + r2.h) - Math.min(r1.y, r2.y) - r1.h - r2.h;
-        int dx = Math.max(0, left);
-        int dy = Math.max(0, top);
-        return Math.sqrt(dx * dx + dy * dy);
     }
 }
