@@ -147,6 +147,7 @@ public class DwgToPng {
         boolean whiteFrameDebugLog = Boolean.parseBoolean(config.getProperty("white_frame_debug_log", "false"));
         double regionRerenderScale = Double.parseDouble(config.getProperty("region_rerender_scale", "2.0"));
         int regionRerenderMaxDimension = Integer.parseInt(config.getProperty("region_rerender_max_dimension", "16384"));
+        long rerenderMaxPixels = Long.parseLong(config.getProperty("rerender_max_pixels", "120000000"));
         boolean keepRegionImages = Boolean.parseBoolean(config.getProperty("keep_region_images", "true"));
         int stitchGap = Integer.parseInt(config.getProperty("stitch_gap", "100"));
         int mergedMaxDimension = Integer.parseInt(config.getProperty("merged_max_dimension", "45000"));
@@ -166,6 +167,8 @@ public class DwgToPng {
         double dwgFrameSearchExpandRatio = Double
                 .parseDouble(config.getProperty("dwg_frame_search_expand_ratio", "1.0"));
         double dwgFrameMarginRatio = Double.parseDouble(config.getProperty("dwg_frame_margin_ratio", "0.02"));
+        double dwgFrameRerenderScale = Double
+                .parseDouble(config.getProperty("dwg_frame_rerender_scale", Double.toString(regionRerenderScale)));
         double dwgFrameMinAreaRatio = Double.parseDouble(config.getProperty("dwg_frame_min_area_ratio", "0.02"));
         boolean dwgFrameDebugLog = Boolean.parseBoolean(config.getProperty("dwg_frame_debug_log", "false"));
         boolean dwgFrameOnly = Boolean.parseBoolean(config.getProperty("dwg_frame_only", "false"));
@@ -325,8 +328,8 @@ public class DwgToPng {
                                 int basePxW = Math.max(1, (int) Math.round(fw * pxPerWorldX));
                                 int basePxH = Math.max(1, (int) Math.round(fh * pxPerWorldY));
 
-                                int[] tileSize = computeRerenderSize(basePxW, basePxH, regionRerenderScale,
-                                        regionRerenderMaxDimension);
+                                int[] tileSize = computeRerenderSize(basePxW, basePxH, dwgFrameRerenderScale,
+                                        regionRerenderMaxDimension, rerenderMaxPixels);
                                 int tileW = tileSize[0];
                                 int tileH = tileSize[1];
 
@@ -462,8 +465,8 @@ public class DwgToPng {
                                 int basePxW = Math.max(1, (int) Math.round(fw * pxPerWorldX));
                                 int basePxH = Math.max(1, (int) Math.round(fh * pxPerWorldY));
 
-                                int[] tileSize = computeRerenderSize(basePxW, basePxH, regionRerenderScale,
-                                        regionRerenderMaxDimension);
+                                int[] tileSize = computeRerenderSize(basePxW, basePxH, dwgFrameRerenderScale,
+                                        regionRerenderMaxDimension, rerenderMaxPixels);
                                 int tileW = tileSize[0];
                                 int tileH = tileSize[1];
 
@@ -554,7 +557,7 @@ public class DwgToPng {
                                 int idx = 1;
                                 for (java.awt.Rectangle rect : frames) {
                                     int[] tileSize = computeRerenderSize(rect.width, rect.height, regionRerenderScale,
-                                            regionRerenderMaxDimension);
+                                            regionRerenderMaxDimension, rerenderMaxPixels);
                                     int tileW = tileSize[0];
                                     int tileH = tileSize[1];
 
@@ -623,7 +626,7 @@ public class DwgToPng {
                         }
 
                         int[] tileSize = computeRerenderSize(rect.width, rect.height, regionRerenderScale,
-                                regionRerenderMaxDimension);
+                                regionRerenderMaxDimension, rerenderMaxPixels);
                         int tileW = tileSize[0];
                         int tileH = tileSize[1];
 
@@ -875,13 +878,21 @@ public class DwgToPng {
         return String.format("%.3f", v);
     }
 
-    private static int[] computeRerenderSize(int baseW, int baseH, double scale, int maxDim) {
+    private static int[] computeRerenderSize(int baseW, int baseH, double scale, int maxDim, long maxPixels) {
         int w = Math.max(1, (int) Math.round(Math.max(1.0, scale) * (double) Math.max(1, baseW)));
         int h = Math.max(1, (int) Math.round(Math.max(1.0, scale) * (double) Math.max(1, baseH)));
         if (maxDim > 0 && (w > maxDim || h > maxDim)) {
             double s = Math.min((double) maxDim / (double) w, (double) maxDim / (double) h);
             w = Math.max(1, (int) Math.floor(w * s));
             h = Math.max(1, (int) Math.floor(h * s));
+        }
+        if (maxPixels > 0) {
+            long area = (long) w * (long) h;
+            if (area > maxPixels) {
+                double s = Math.sqrt((double) maxPixels / (double) area);
+                w = Math.max(1, (int) Math.floor(w * s));
+                h = Math.max(1, (int) Math.floor(h * s));
+            }
         }
         return new int[] { w, h };
     }
